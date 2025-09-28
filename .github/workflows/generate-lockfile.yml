@@ -1,0 +1,27 @@
+name: Generate npm lockfile
+on:
+  workflow_dispatch: {}   # 手動実行
+
+permissions:
+  contents: write         # 自動コミットに必要
+
+jobs:
+  gen-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # lock だけ作る（依存は実際にインストールしない）
+      - name: Create package-lock.json
+        run: npm install --package-lock-only --no-audit --no-fund
+
+      # 生成物を自動コミット
+      - name: Commit lockfile
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: add package-lock.json (auto)"
+          file_pattern: "package-lock.json"

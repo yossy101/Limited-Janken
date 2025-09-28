@@ -10,15 +10,15 @@
     "test": "jest",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "@supabase/supabase-js": "file:vendor/supabase-js",
-    "framer-motion": "^10.16.4",
-    "next": "13.5.6",
-    "qrcode.react": "^3.1.0",
-    "react": "18.2.0",
-    "react-dom": "18.2.0",
-    "zod": "^3.22.4"
-  },
+"dependencies": {
+  "@supabase/supabase-js": "^2.42.0",   // 安定版を指定
+  "framer-motion": "^10.16.4",
+  "next": "13.5.6",
+  "qrcode.react": "^3.1.0",
+  "react": "18.2.0",
+  "react-dom": "18.2.0",
+  "zod": "^3.22.4"
+}
   "devDependencies": {
     "@testing-library/jest-dom": "^6.1.4",
     "@testing-library/react": "^14.0.0",

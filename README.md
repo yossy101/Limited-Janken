@@ -25,6 +25,7 @@ npm install
 | `NEXT_PUBLIC_SUPABASE_URL` | Supabase プロジェクト URL |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon キー |
 | `SUPABASE_SERVICE_ROLE_KEY` | Edge Functions で使用する service role キー |
+| `SUPABASE_DB_URL` | Edge Functions のトランザクションアクセス用データベースURL |
 
 Edge Functions には `SUPABASE_URL` も必要です (Supabase CLI の `.env` で自動設定されます)。
 

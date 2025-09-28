@@ -1,18 +1,47 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { z } from "npm:zod";
-import { createServiceClient } from "./_shared/supabaseClient.ts";
-import { judgeRound, Hand } from "../shared/game/engine.ts";
+import { withTransaction, selectOne, selectMany, nowIso } from "./_shared/db.ts";
+import { planResolution } from "./_shared/logic/resolveMatch.ts";
+import type { Hand } from "../shared/game/engine.ts";
 
 const schema = z.object({
   match_id: z.string().uuid()
 });
+
+type MatchRow = {
+  id: string;
+  room_id: string;
+  challenger_id: string;
+  opponent_id: string;
+  challenger_name: string | null;
+  opponent_name: string | null;
+};
+
+type MoveRow = {
+  player_id: string;
+  hand: string;
+};
+
+type AssetRow = {
+  player_id: string;
+  stars: number;
+};
 
 serve(async (req) => {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const payload = await req.json();
+  let payload: unknown;
+  try {
+    payload = await req.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
     return new Response(JSON.stringify({ error: parsed.error.message }), {
@@ -22,143 +51,139 @@ serve(async (req) => {
   }
 
   const { match_id } = parsed.data;
-  const supabase = createServiceClient();
 
-  const { data: match, error: matchError } = await supabase
-    .from("matches")
-    .select("id, room_id, challenger_id, opponent_id, status, challenger:challenger_id(name), opponent:opponent_id(name)")
-    .eq("id", match_id)
-    .single();
-
-  if (matchError || !match) {
-    return new Response(JSON.stringify({ error: matchError?.message ?? "Match not found" }), {
-      status: 404,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const { data: setMoves, error: setError } = await supabase
-    .from("match_moves")
-    .select("player_id, hand")
-    .eq("match_id", match_id)
-    .eq("phase", "set");
-
-  if (setError) {
-    return new Response(JSON.stringify({ error: setError.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const { data: openMoves, error: openError } = await supabase
-    .from("match_moves")
-    .select("player_id")
-    .eq("match_id", match_id)
-    .eq("phase", "open");
-
-  if (openError) {
-    return new Response(JSON.stringify({ error: openError.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  if (!setMoves || setMoves.length < 2) {
-    return new Response(JSON.stringify({ error: "Both players must set a card" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const openPlayerIds = new Set(openMoves?.map((move) => move.player_id) ?? []);
-  if (!openPlayerIds.has(match.challenger_id) || !openPlayerIds.has(match.opponent_id)) {
-    return new Response(JSON.stringify({ error: "両者がオープンする必要があります" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const challengerMove = setMoves.find((move) => move.player_id === match.challenger_id);
-  const opponentMove = setMoves.find((move) => move.player_id === match.opponent_id);
-
-  if (!challengerMove || !opponentMove) {
-    return new Response(JSON.stringify({ error: "セット情報が不足しています" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const challengerHand = challengerMove.hand as Hand;
-  const opponentHand = opponentMove.hand as Hand;
-  const result = judgeRound({ playerId: match.challenger_id, hand: challengerHand }, { playerId: match.opponent_id, hand: opponentHand });
-
-  const updates: Promise<unknown>[] = [];
-  let message = `${match.challenger?.name ?? "挑戦者"}(${challengerHand}) vs ${match.opponent?.name ?? "相手"}(${opponentHand}) はあいこでした。`;
-
-  if (result.winner && result.loser) {
-    const winnerId = result.winner;
-    const loserId = result.loser;
-
-    const { data: winnerAsset } = await supabase
-      .from("player_assets")
-      .select("stars")
-      .eq("player_id", winnerId)
-      .single();
-
-    const { data: loserAsset } = await supabase
-      .from("player_assets")
-      .select("stars")
-      .eq("player_id", loserId)
-      .single();
-
-    if (winnerAsset && loserAsset && loserAsset.stars > 0) {
-      updates.push(
-        supabase
-          .from("player_assets")
-          .update({ stars: (winnerAsset.stars ?? 0) + 1, updated_at: new Date().toISOString() })
-          .eq("player_id", winnerId)
+  try {
+    const result = await withTransaction(async (client) => {
+      const match = await selectOne<MatchRow>(
+        client,
+        `select m.id, m.room_id, m.challenger_id, m.opponent_id, c.name as challenger_name, o.name as opponent_name
+         from matches m
+         join players c on c.id = m.challenger_id
+         join players o on o.id = m.opponent_id
+         where m.id = $1
+         for update`,
+        [match_id]
       );
-      updates.push(
-        supabase
-          .from("player_assets")
-          .update({ stars: Math.max(0, (loserAsset.stars ?? 0) - 1), updated_at: new Date().toISOString() })
-          .eq("player_id", loserId)
+
+      if (!match) {
+        throw new Error("Match not found");
+      }
+
+      const setMoves = await selectMany<MoveRow>(
+        client,
+        "select player_id, hand from match_moves where match_id = $1 and phase = 'set'",
+        [match_id]
       );
-      updates.push(
-        supabase
-          .from("star_transfers")
-          .insert({ room_id: match.room_id, from_player: loserId, to_player: winnerId, amount: 1 })
+      if (setMoves.length < 2) {
+        throw new Error("Both players must set a card");
+      }
+
+      const openMoves = await selectMany<{ player_id: string }>(
+        client,
+        "select player_id from match_moves where match_id = $1 and phase = 'open'",
+        [match_id]
       );
-      message = `${match.challenger?.name ?? "挑戦者"}(${challengerHand}) と ${match.opponent?.name ?? "相手"}(${opponentHand}) の勝者は ${(winnerId === match.challenger_id ? match.challenger?.name : match.opponent?.name) ?? ""} です。`;
+      const openSet = new Set(openMoves.map((row) => row.player_id));
+      if (!openSet.has(match.challenger_id) || !openSet.has(match.opponent_id)) {
+        throw new Error("両者がオープンする必要があります");
+      }
+
+      const challengerMove = setMoves.find((move) => move.player_id === match.challenger_id);
+      const opponentMove = setMoves.find((move) => move.player_id === match.opponent_id);
+      if (!challengerMove || !opponentMove) {
+        throw new Error("セット情報が不足しています");
+      }
+
+      const assets = await selectMany<AssetRow>(
+        client,
+        "select player_id, stars from player_assets where player_id in ($1, $2) for update",
+        [match.challenger_id, match.opponent_id]
+      );
+      const challengerAsset = assets.find((asset) => asset.player_id === match.challenger_id) ?? null;
+      const opponentAsset = assets.find((asset) => asset.player_id === match.opponent_id) ?? null;
+
+      const plan = planResolution(
+        {
+          challengerId: match.challenger_id,
+          opponentId: match.opponent_id,
+          roomId: match.room_id,
+          challengerName: match.challenger_name,
+          opponentName: match.opponent_name
+        },
+        { player_id: challengerMove.player_id, hand: challengerMove.hand as Hand },
+        { player_id: opponentMove.player_id, hand: opponentMove.hand as Hand },
+        challengerAsset,
+        opponentAsset
+      );
+
+      let shouldTransfer = plan.shouldTransferStar;
+      if (shouldTransfer && plan.winnerId && plan.loserId && challengerAsset && opponentAsset) {
+        if (plan.loserId === challengerAsset.player_id) {
+          if (challengerAsset.stars <= 0) {
+            shouldTransfer = false;
+          }
+        } else if (opponentAsset && opponentAsset.player_id === plan.loserId && opponentAsset.stars <= 0) {
+          shouldTransfer = false;
+        }
+      }
+
+      if (shouldTransfer && plan.winnerId && plan.loserId) {
+        await client.queryObject({
+          text: "update player_assets set stars = stars + 1, updated_at = $1 where player_id = $2",
+          args: [nowIso(), plan.winnerId]
+        });
+        await client.queryObject({
+          text: "update player_assets set stars = greatest(stars - 1, 0), updated_at = $1 where player_id = $2",
+          args: [nowIso(), plan.loserId]
+        });
+        await client.queryObject({
+          text: "insert into star_transfers (room_id, from_player, to_player, amount, created_at) values ($1, $2, $3, 1, $4)",
+          args: [match.room_id, plan.loserId, plan.winnerId, nowIso()]
+        });
+      }
+
+      await client.queryObject({
+        text: "update matches set status = 'resolved', resolved_at = $1 where id = $2",
+        args: [nowIso(), match_id]
+      });
+
+      await client.queryObject({
+        text: "insert into used_card_logs (player_id, match_id, hand, created_at) values ($1, $2, $3, $4)",
+        args: [match.challenger_id, match_id, challengerMove.hand, nowIso()]
+      });
+      await client.queryObject({
+        text: "insert into used_card_logs (player_id, match_id, hand, created_at) values ($1, $2, $3, $4)",
+        args: [match.opponent_id, match_id, opponentMove.hand, nowIso()]
+      });
+
+      await client.queryObject({
+        text: "insert into events (room_id, message, created_at) values ($1, $2, $3)",
+        args: [match.room_id, plan.message, nowIso()]
+      });
+
+      return {
+        result: {
+          outcome: plan.outcome,
+          winner: plan.winnerId,
+          loser: plan.loserId
+        }
+      };
+    });
+
+    return new Response(JSON.stringify(result), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unexpected error";
+    let status = 500;
+    if (message === "Match not found") status = 404;
+    else if (message === "Both players must set a card" || message === "両者がオープンする必要があります" || message === "セット情報が不足しています") {
+      status = 400;
     }
+    return new Response(JSON.stringify({ error: message }), {
+      status,
+      headers: { "Content-Type": "application/json" }
+    });
   }
-
-  updates.push(
-    supabase
-      .from("matches")
-      .update({ status: "resolved", resolved_at: new Date().toISOString() })
-      .eq("id", match_id)
-  );
-
-  updates.push(
-    supabase
-      .from("used_card_logs")
-      .insert([
-        { player_id: match.challenger_id, match_id, hand: challengerHand },
-        { player_id: match.opponent_id, match_id, hand: opponentHand }
-      ])
-  );
-
-  updates.push(
-    supabase
-      .from("events")
-      .insert({ room_id: match.room_id, message })
-  );
-
-  await Promise.all(updates);
-
-  return new Response(JSON.stringify({ result }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" }
-  });
 });

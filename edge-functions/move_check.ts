@@ -1,6 +1,6 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { z } from "npm:zod";
-import { createServiceClient } from "./_shared/supabaseClient.ts";
+import { withTransaction, nowIso } from "./_shared/db.ts";
 
 const schema = z.object({
   match_id: z.string().uuid(),
@@ -12,7 +12,16 @@ serve(async (req) => {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const payload = await req.json();
+  let payload: unknown;
+  try {
+    payload = await req.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
     return new Response(JSON.stringify({ error: parsed.error.message }), {
@@ -21,22 +30,39 @@ serve(async (req) => {
     });
   }
 
-  const supabase = createServiceClient();
   const { match_id, player_id } = parsed.data;
 
-  const { error } = await supabase
-    .from("match_moves")
-    .insert({ match_id, player_id, phase: "check" });
+  try {
+    await withTransaction(async (client) => {
+      const matchExists = await client.queryObject({
+        text: "select 1 from matches where id = $1 for update",
+        args: [match_id]
+      });
+      if (matchExists.rows.length === 0) {
+        throw new Error("Match not found");
+      }
 
-  if (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
+      await client.queryObject({
+        text: "delete from match_moves where match_id = $1 and player_id = $2 and phase = 'check'",
+        args: [match_id, player_id]
+      });
+
+      await client.queryObject({
+        text: "insert into match_moves (match_id, player_id, phase, created_at) values ($1, $2, 'check', $3)",
+        args: [match_id, player_id, nowIso()]
+      });
+    });
+
+    return new Response(JSON.stringify({ status: "check" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unexpected error";
+    const status = message === "Match not found" ? 404 : 500;
+    return new Response(JSON.stringify({ error: message }), {
+      status,
       headers: { "Content-Type": "application/json" }
     });
   }
-
-  return new Response(JSON.stringify({ status: "check" }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" }
-  });
 });

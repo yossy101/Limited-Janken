@@ -1,6 +1,6 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { z } from "npm:zod";
-import { createServiceClient } from "./_shared/supabaseClient.ts";
+import { withTransaction, selectOne, nowIso } from "./_shared/db.ts";
 
 const schema = z.object({
   match_id: z.string().uuid(),
@@ -13,7 +13,16 @@ serve(async (req) => {
     return new Response("Method not allowed", { status: 405 });
   }
 
-  const payload = await req.json();
+  let payload: unknown;
+  try {
+    payload = await req.json();
+  } catch {
+    return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
     return new Response(JSON.stringify({ error: parsed.error.message }), {
@@ -22,60 +31,50 @@ serve(async (req) => {
     });
   }
 
-  const supabase = createServiceClient();
   const { match_id, player_id, hand } = parsed.data;
 
-  const { data: asset, error: assetError } = await supabase
-    .from("player_assets")
-    .select("id, rock, paper, scissors")
-    .eq("player_id", player_id)
-    .single();
+  try {
+    await withTransaction(async (client) => {
+      const asset = await selectOne<{ rock: number; paper: number; scissors: number }>(
+        client,
+        "select rock, paper, scissors from player_assets where player_id = $1 for update",
+        [player_id]
+      );
+      if (!asset) {
+        throw new Error("Asset not found");
+      }
 
-  if (assetError || !asset) {
-    return new Response(JSON.stringify({ error: assetError?.message ?? "Asset not found" }), {
-      status: 404,
+      const handColumn = hand === "rock" ? "rock" : hand === "paper" ? "paper" : "scissors";
+      if ((asset as Record<string, number>)[handColumn] <= 0) {
+        throw new Error("カード在庫が不足しています");
+      }
+
+      await client.queryObject({
+        text: `update player_assets set ${handColumn} = ${handColumn} - 1, updated_at = $1 where player_id = $2`,
+        args: [nowIso(), player_id]
+      });
+
+      await client.queryObject({
+        text: "delete from match_moves where match_id = $1 and player_id = $2 and phase = 'set'",
+        args: [match_id, player_id]
+      });
+
+      await client.queryObject({
+        text: "insert into match_moves (match_id, player_id, phase, hand, created_at) values ($1, $2, 'set', $3, $4)",
+        args: [match_id, player_id, hand, nowIso()]
+      });
+    });
+
+    return new Response(JSON.stringify({ status: "set" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unexpected error";
+    const status = message === "Asset not found" ? 404 : message === "カード在庫が不足しています" ? 400 : 500;
+    return new Response(JSON.stringify({ error: message }), {
+      status,
       headers: { "Content-Type": "application/json" }
     });
   }
-
-  const handColumn = hand === "rock" ? "rock" : hand === "paper" ? "paper" : "scissors";
-  if (asset[handColumn] <= 0) {
-    return new Response(JSON.stringify({ error: "カード在庫が不足しています" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const updatePayload: Record<string, number | string> = {
-    [handColumn]: asset[handColumn] - 1,
-    updated_at: new Date().toISOString()
-  };
-
-  const { error: updateError } = await supabase
-    .from("player_assets")
-    .update(updatePayload)
-    .eq("player_id", player_id);
-
-  if (updateError) {
-    return new Response(JSON.stringify({ error: updateError.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  const { error: insertError } = await supabase
-    .from("match_moves")
-    .insert({ match_id, player_id, phase: "set", hand });
-
-  if (insertError) {
-    return new Response(JSON.stringify({ error: insertError.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" }
-    });
-  }
-
-  return new Response(JSON.stringify({ status: "set" }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" }
-  });
 });

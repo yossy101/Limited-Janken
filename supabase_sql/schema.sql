@@ -28,6 +28,17 @@ create table if not exists player_assets (
   updated_at timestamptz not null default now()
 );
 
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'player_assets_player_id_key'
+  ) then
+    alter table player_assets
+      add constraint player_assets_player_id_key unique (player_id);
+  end if;
+end $$;
+
 create table if not exists matches (
   id uuid primary key default gen_random_uuid(),
   room_id uuid not null references rooms(id) on delete cascade,
@@ -46,6 +57,17 @@ create table if not exists match_moves (
   hand text,
   created_at timestamptz not null default now()
 );
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'match_moves_unique_phase'
+  ) then
+    alter table match_moves
+      add constraint match_moves_unique_phase unique (match_id, player_id, phase);
+  end if;
+end $$;
 
 create table if not exists used_card_logs (
   id uuid primary key default gen_random_uuid(),

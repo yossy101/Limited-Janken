@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-night text-white font-sans;
+}
+
+:root {
+  color-scheme: dark;
+}
